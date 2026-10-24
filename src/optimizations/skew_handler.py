@@ -24,7 +24,7 @@ Usage:
     ...     result = handler.salted_join(orders_df, merchant_dim_df, "merchant_id")
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
@@ -211,85 +211,87 @@ class SkewHandler:
         key_col: str,
         num_salts: int = 10,
         join_type: str = "inner",
+        id_col: Optional[str] = None,
     ) -> DataFrame:
-        """Perform a salted join to distribute skewed keys across partitions.
+        """Perform a deterministic salted join to distribute skewed keys across partitions.
 
-        Instead of all records for "MERCHANT_001" going to a single executor,
-        we append a random salt (0-N) to the key on the left side and
-        explode the right side with all salt values. This spreads the
-        hot key across N partitions.
-
-        Before salting:
-            Left:  (MERCHANT_001, data) → ALL go to partition 42
-            Right: (MERCHANT_001, dim)  → Also partition 42
-            Result: Partition 42 has 60% of all data = OOM
-
-        After salting (N=10):
-            Left:  (MERCHANT_001_3, data) → partition 12
-                   (MERCHANT_001_7, data) → partition 28
-                   (MERCHANT_001_1, data) → partition 5
-            Right: (MERCHANT_001_0, dim), (MERCHANT_001_1, dim), ...
-            Result: Hot key spread across 10 partitions = balanced
+        Instead of non-deterministic pseudo-random salting (rand()), this implementation
+        derives salt values via pmod(xxhash64(stable_id), N). This ensures:
+        1. Determinism and idempotence across Spark task retries and speculative executions.
+        2. Correct join alignment without partition drift.
 
         Args:
             left_df: Large (fact) DataFrame with the skewed key.
             right_df: Smaller (dimension) DataFrame to join against.
             key_col: Join key column name (present in both DataFrames).
-            num_salts: Number of salt buckets (higher = more parallelism).
+            num_salts: Number of salt buckets to spread hot partitions across.
             join_type: Join type ("inner", "left", "left_outer", etc.).
+            id_col: Stable identifier column (e.g., 'order_id', 'event_id').
 
         Returns:
-            Joined DataFrame with salt columns removed.
+            Joined DataFrame with salt metadata columns removed.
         """
         self.logger.info(
-            f"Performing salted join on '{key_col}' with {num_salts} buckets"
+            f"Performing deterministic salted join on '{key_col}' with {num_salts} buckets"
         )
 
-        # Step 1: Add random salt to left (large) table
-        # Uses deterministic floor(rand() * N) — same record always gets
-        # the same salt within a single execution, ensuring correctness.
-        salted_left = left_df.withColumn(
-            "_salt",
-            F.floor(F.rand() * num_salts).cast("int"),
-        ).withColumn(
+        # Step 1: Compute deterministic salt for left table using stable hash
+        salt_col = id_col
+        if not salt_col:
+            candidate_ids = ["order_id", "event_id", "session_id", "transaction_id", "id"]
+            salt_col = next((c for c in candidate_ids if c in left_df.columns), None)
+
+        if salt_col:
+            salt_expr = F.pmod(F.xxhash64(F.col(salt_col)), F.lit(num_salts)).cast("int")
+        else:
+            non_key = [c for c in left_df.columns if c != key_col]
+            if non_key:
+                salt_expr = F.pmod(
+                    F.xxhash64(*[F.coalesce(F.col(c).cast(StringType()), F.lit("")) for c in non_key[:4]]),
+                    F.lit(num_salts)
+                ).cast("int")
+            else:
+                salt_expr = F.pmod(F.xxhash64(F.monotonically_increasing_id()), F.lit(num_salts)).cast("int")
+
+        salted_left = left_df.withColumn("_salt", salt_expr).withColumn(
             "_salted_key",
-            F.concat(F.col(key_col).cast(StringType()), F.lit("_"), F.col("_salt")),
+            F.concat(
+                F.coalesce(F.col(key_col).cast(StringType()), F.lit("__NULL__")),
+                F.lit("_"),
+                F.col("_salt").cast(StringType())
+            ),
         )
 
-        # Step 2: Explode right (small) table with all salt values
-        # Each right-side row gets replicated N times, once per salt bucket.
-        # This is acceptable because the right table is small (dimension table).
+        # Step 2: Explode right (small) table with all salt values (0..num_salts-1)
         salt_range = self.spark.range(num_salts).withColumnRenamed("id", "_salt")
 
         salted_right = right_df.crossJoin(salt_range).withColumn(
             "_salted_key",
             F.concat(
-                F.col(key_col).cast(StringType()), F.lit("_"), F.col("_salt")
+                F.coalesce(F.col(key_col).cast(StringType()), F.lit("__NULL__")),
+                F.lit("_"),
+                F.col("_salt").cast(StringType())
             ),
         )
 
-        # Step 3: Join on the salted key instead of the original key
+        # Step 3: Join on the composite salted key
         result = salted_left.join(
             salted_right,
             on="_salted_key",
             how=join_type,
         )
 
-        # Step 4: Clean up — remove salt columns, resolve ambiguous key column
-        columns_to_drop = ["_salt", "_salted_key"]
-
-        # Handle duplicate key columns from the join
+        # Step 4: Clean up temporary salt columns and resolve key projection
         left_cols = [c for c in left_df.columns if c != key_col]
         right_cols = [c for c in right_df.columns if c != key_col]
 
-        # Select left's key column + all non-key columns from both sides
         select_cols = [salted_left[key_col]]
         select_cols += [salted_left[c] for c in left_cols]
         select_cols += [salted_right[c] for c in right_cols]
 
         result = result.select(*select_cols)
 
-        self.logger.info("Salted join complete")
+        self.logger.info("Deterministic salted join complete")
         return result
 
     # ──────────────────────────────────────────────────────────
@@ -299,91 +301,96 @@ class SkewHandler:
     def salted_aggregation(
         self,
         df: DataFrame,
-        key_col: str,
+        group_cols: Union[str, List[str]],
         agg_exprs: Dict[str, str],
         num_salts: int = 10,
+        id_col: Optional[str] = None,
     ) -> DataFrame:
-        """Perform a two-stage salted aggregation for skewed keys.
+        """Perform a two-stage deterministic salted aggregation for skewed keys.
 
-        Standard groupBy on a skewed key sends 60% of data to one reducer.
-        Salted aggregation works in two stages:
+        Standard groupBy on a skewed key sends all records for dominant keys to one reducer.
+        This two-stage salted aggregation distributes the work safely:
 
-        Stage 1 (Partial): Group by (key + salt) — spreads hot keys across
-                           N reducers, each processing 1/N of the hot key's data.
+        Stage 1 (Partial): Group by native [group_cols + salt]. Spreads high-volume keys
+                           across N parallel reducers, computing partial metrics.
+        Stage 2 (Final):   Group by native [group_cols], rolling up the partial metrics.
 
-        Stage 2 (Final):   Group by (key) — combines the N partial aggregates.
-                           Now each reducer only combines N small partial results
-                           instead of processing millions of raw records.
+        Key Architectural Safeguards:
+        - Deterministic salting via pmod(xxhash64(id), N) ensures task retry safety.
+        - Supports composite grouping columns natively without string concatenation,
+          guaranteeing null keys never corrupt secondary partition columns (e.g. event_date).
 
         Args:
             df: DataFrame to aggregate.
-            key_col: Column to group by (the skewed key).
-            agg_exprs: Dict mapping column_name → agg_function.
-                       Supported: "sum", "count", "avg", "min", "max".
-                       Example: {"total_amount": "sum", "order_id": "count"}
+            group_cols: Single column name or list of columns to group by.
+            agg_exprs: Dict mapping column_name -> agg_function ('sum', 'count', 'avg', 'min', 'max').
             num_salts: Number of salt buckets for stage 1.
+            id_col: Optional column name for deterministic salt computation.
 
         Returns:
             Aggregated DataFrame with final results.
         """
+        cols = [group_cols] if isinstance(group_cols, str) else list(group_cols)
         self.logger.info(
-            f"Starting two-stage salted aggregation on '{key_col}'"
+            f"Starting two-stage deterministic salted aggregation on {cols}"
         )
 
-        # ── Stage 1: Partial aggregation with salted keys ──
-        salted_df = df.withColumn(
-            "_salted_key",
-            F.concat(
-                F.col(key_col).cast(StringType()),
-                F.lit("_"),
-                F.floor(F.rand() * num_salts).cast("string"),
-            ),
-        )
+        # ── Deterministic salt derivation ──
+        salt_col = id_col
+        if not salt_col:
+            candidate_ids = ["order_id", "event_id", "session_id", "transaction_id", "id"]
+            salt_col = next((c for c in candidate_ids if c in df.columns), None)
 
-        # Build stage-1 aggregation expressions
+        if salt_col:
+            salt_expr = F.pmod(F.xxhash64(F.col(salt_col)), F.lit(num_salts)).cast("int")
+        else:
+            non_group = [c for c in df.columns if c not in cols]
+            if non_group:
+                salt_expr = F.pmod(
+                    F.xxhash64(*[F.coalesce(F.col(c).cast(StringType()), F.lit("")) for c in non_group[:4]]),
+                    F.lit(num_salts)
+                ).cast("int")
+            else:
+                salt_expr = F.pmod(F.xxhash64(F.monotonically_increasing_id()), F.lit(num_salts)).cast("int")
+
+        salted_df = df.withColumn("_salt", salt_expr)
+
+        # ── Stage 1: Partial aggregation with native grouping columns + _salt ──
         stage1_aggs = []
         for col_name, agg_func in agg_exprs.items():
             if agg_func == "sum":
-                stage1_aggs.append(F.sum(col_name).alias(f"_partial_{col_name}"))
+                stage1_aggs.append(F.sum(col_name).alias(f"_partial_sum_{col_name}"))
             elif agg_func == "count":
-                stage1_aggs.append(F.count(col_name).alias(f"_partial_{col_name}"))
+                stage1_aggs.append(F.count(col_name).alias(f"_partial_count_{col_name}"))
             elif agg_func == "min":
-                stage1_aggs.append(F.min(col_name).alias(f"_partial_{col_name}"))
+                stage1_aggs.append(F.min(col_name).alias(f"_partial_min_{col_name}"))
             elif agg_func == "max":
-                stage1_aggs.append(F.max(col_name).alias(f"_partial_{col_name}"))
+                stage1_aggs.append(F.max(col_name).alias(f"_partial_max_{col_name}"))
             elif agg_func == "avg":
-                # For avg, we need sum + count to combine in stage 2
                 stage1_aggs.append(F.sum(col_name).alias(f"_partial_sum_{col_name}"))
                 stage1_aggs.append(F.count(col_name).alias(f"_partial_count_{col_name}"))
 
-        partial_df = salted_df.groupBy("_salted_key", key_col).agg(*stage1_aggs)
+        partial_df = salted_df.groupBy(*cols, "_salt").agg(*stage1_aggs)
 
-        # ── Stage 2: Final aggregation on original key ──
+        # ── Stage 2: Final roll-up on native grouping columns ──
         stage2_aggs = []
         for col_name, agg_func in agg_exprs.items():
-            if agg_func in ("sum", "count"):
-                # Sum of partial sums/counts = total sum/count
-                stage2_aggs.append(
-                    F.sum(f"_partial_{col_name}").alias(col_name)
-                )
+            if agg_func == "sum":
+                stage2_aggs.append(F.sum(f"_partial_sum_{col_name}").alias(col_name))
+            elif agg_func == "count":
+                stage2_aggs.append(F.sum(f"_partial_count_{col_name}").alias(col_name))
             elif agg_func == "min":
-                stage2_aggs.append(
-                    F.min(f"_partial_{col_name}").alias(col_name)
-                )
+                stage2_aggs.append(F.min(f"_partial_min_{col_name}").alias(col_name))
             elif agg_func == "max":
-                stage2_aggs.append(
-                    F.max(f"_partial_{col_name}").alias(col_name)
-                )
+                stage2_aggs.append(F.max(f"_partial_max_{col_name}").alias(col_name))
             elif agg_func == "avg":
-                # avg = total_sum / total_count
                 stage2_aggs.append(
-                    (F.sum(f"_partial_sum_{col_name}") /
-                     F.sum(f"_partial_count_{col_name}")).alias(col_name)
+                    (F.sum(f"_partial_sum_{col_name}") / F.sum(f"_partial_count_{col_name}")).alias(col_name)
                 )
 
-        result = partial_df.groupBy(key_col).agg(*stage2_aggs)
+        result = partial_df.groupBy(*cols).agg(*stage2_aggs)
 
-        self.logger.info("Two-stage salted aggregation complete")
+        self.logger.info("Two-stage deterministic salted aggregation complete")
         return result
 
     # ──────────────────────────────────────────────────────────

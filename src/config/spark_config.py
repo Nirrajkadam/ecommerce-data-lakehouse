@@ -13,8 +13,16 @@ Key Optimizations:
     - Memory management for streaming workloads
 """
 
+import os
+from typing import Optional, Dict, Any, List
 from pyspark.sql import SparkSession
-from typing import Optional, Dict, Any
+
+# Try importing Delta Lake helper utilities
+try:
+    from delta import configure_spark_with_delta_pip
+    HAS_DELTA_PIP = True
+except ImportError:
+    HAS_DELTA_PIP = False
 
 
 class SparkConfig:
@@ -190,6 +198,12 @@ class SparkConfig:
 
         return merged
 
+    # Required Maven packages for Delta Lake 3.1.0 and Spark Kafka connector on Spark 3.5.x
+    DEFAULT_PACKAGES: List[str] = [
+        "io.delta:delta-spark_2.12:3.1.0",
+        "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
+    ]
+
     def create_session(self) -> SparkSession:
         """Create and return an optimized SparkSession.
 
@@ -198,6 +212,7 @@ class SparkConfig:
         - Small files mitigation via Delta Lake auto-compaction
         - Memory management for streaming workloads
         - Broadcast join optimization for dimension tables
+        - JVM packages for Delta Lake and Spark Kafka integration
 
         Returns:
             Configured SparkSession instance.
@@ -208,8 +223,23 @@ class SparkConfig:
         for key, value in configs.items():
             builder = builder.config(key, value)
 
-        # Enable Hive support for Delta Lake catalog integration
-        spark = builder.enableHiveSupport().getOrCreate()
+        # Ensure Delta Lake and Kafka JVM packages are loaded
+        kafka_package = "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+        if HAS_DELTA_PIP:
+            # configure_spark_with_delta_pip resolves local delta jar and adds extra packages
+            builder = configure_spark_with_delta_pip(
+                builder,
+                extra_packages=[kafka_package],
+            )
+        else:
+            # Fallback: explicitly declare Maven coordinates
+            current_packages = configs.get("spark.jars.packages", "")
+            packages_to_add = [p for p in self.DEFAULT_PACKAGES if p not in current_packages]
+            if packages_to_add:
+                combined = f"{current_packages},{','.join(packages_to_add)}" if current_packages else ",".join(packages_to_add)
+                builder = builder.config("spark.jars.packages", combined)
+
+        spark = builder.getOrCreate()
 
         # Set log level to reduce noise in development
         spark.sparkContext.setLogLevel("WARN")

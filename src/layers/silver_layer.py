@@ -23,6 +23,8 @@ from typing import List, Optional
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.streaming import StreamingQuery
 
 from src.config.pipeline_config import PipelineConfig
 from src.optimizations.skew_handler import SkewHandler
@@ -55,59 +57,96 @@ class SilverLayer:
     # ──────────────────────────────────────────────────────────
 
     def _clean_orders(self, df: DataFrame) -> DataFrame:
-        """Clean and validate order records.
+        """Clean, validate, and deterministically deduplicate order records.
 
         Operations:
-            - Remove exact duplicates on order_id
-            - Cast types and handle nulls
-            - Filter invalid amounts
-            - Standardize timestamps
+            - Validates non-null order_id and positive total_amount
+            - Deterministically selects the latest record for each order_id using
+              an ordered Window (event_timestamp DESC, _ingestion_timestamp DESC, order_status DESC)
+            - Standardizes null currencies and payment methods
+            - Ensures event_date is derived from timestamp if missing
         """
-        self.logger.info("Cleaning order data")
+        self.logger.info("Cleaning order data with deterministic latest-record windowing")
 
+        # Filter invalid records
+        valid_df = df.filter(F.col("order_id").isNotNull()).filter(F.col("total_amount") > 0)
+
+        # Build deterministic ordering for deduplication
+        order_specs = []
+        if "event_timestamp" in valid_df.columns:
+            order_specs.append(F.col("event_timestamp").desc_nulls_last())
+        if "_ingestion_timestamp" in valid_df.columns:
+            order_specs.append(F.col("_ingestion_timestamp").desc_nulls_last())
+        if "order_status" in valid_df.columns:
+            order_specs.append(F.col("order_status").desc_nulls_last())
+
+        # Deterministic tie-breaker
+        order_specs.append(F.lit(1))
+        window_spec = Window.partitionBy("order_id").orderBy(*order_specs)
+
+        # Retain only the newest record per order_id
         cleaned = (
-            df
-            # Deduplicate by order_id, keeping the latest record
-            .dropDuplicates(["order_id"])
-            # Filter invalid records
-            .filter(F.col("order_id").isNotNull())
-            .filter(F.col("total_amount") > 0)
-            # Standardize nulls
-            .withColumn(
+            valid_df
+            .withColumn("_row_num", F.row_number().over(window_spec))
+            .filter(F.col("_row_num") == 1)
+            .drop("_row_num")
+        )
+
+        # Standardize optional columns safely without assuming schema existence
+        if "payment_method" in cleaned.columns:
+            cleaned = cleaned.withColumn(
                 "payment_method",
                 F.coalesce(F.col("payment_method"), F.lit("unknown")),
             )
-            .withColumn(
+        if "currency" in cleaned.columns:
+            cleaned = cleaned.withColumn(
                 "currency",
                 F.coalesce(F.col("currency"), F.lit("INR")),
             )
-            # Ensure event_date is populated
-            .withColumn(
+
+        if "event_date" in cleaned.columns and "event_timestamp" in cleaned.columns:
+            cleaned = cleaned.withColumn(
                 "event_date",
                 F.coalesce(
                     F.col("event_date"),
                     F.date_format(F.col("event_timestamp"), "yyyy-MM-dd"),
                 ),
             )
-        )
+        elif "event_timestamp" in cleaned.columns and "event_date" not in cleaned.columns:
+            cleaned = cleaned.withColumn(
+                "event_date",
+                F.date_format(F.col("event_timestamp"), "yyyy-MM-dd"),
+            )
 
         return cleaned
 
     def _clean_clickstream(self, df: DataFrame) -> DataFrame:
-        """Clean and validate clickstream records."""
+        """Clean, validate, and deterministically deduplicate clickstream records."""
         self.logger.info("Cleaning clickstream data")
 
+        valid_df = df.filter(F.col("event_id").isNotNull()).filter(F.col("session_id").isNotNull())
+
+        order_specs = []
+        if "event_timestamp" in valid_df.columns:
+            order_specs.append(F.col("event_timestamp").desc_nulls_last())
+        if "_ingestion_timestamp" in valid_df.columns:
+            order_specs.append(F.col("_ingestion_timestamp").desc_nulls_last())
+        order_specs.append(F.lit(1))
+
+        window_spec = Window.partitionBy("event_id").orderBy(*order_specs)
         cleaned = (
-            df
-            .dropDuplicates(["event_id"])
-            .filter(F.col("event_id").isNotNull())
-            .filter(F.col("session_id").isNotNull())
-            .withColumn(
+            valid_df
+            .withColumn("_row_num", F.row_number().over(window_spec))
+            .filter(F.col("_row_num") == 1)
+            .drop("_row_num")
+        )
+
+        if "duration_seconds" in cleaned.columns:
+            cleaned = cleaned.withColumn(
                 "duration_seconds",
                 F.when(F.col("duration_seconds") < 0, 0)
                 .otherwise(F.col("duration_seconds")),
             )
-        )
 
         return cleaned
 
@@ -274,3 +313,94 @@ class SilverLayer:
 
         self.logger.info(f"Silver clickstream complete: {record_count} records")
         return record_count
+
+    # ──────────────────────────────────────────────────────────
+    # CONTINUOUS STREAMING ENRICHMENT (DELTA MERGE UPSERT)
+    # ──────────────────────────────────────────────────────────
+
+    def upsert_orders_batch(
+        self,
+        batch_df: DataFrame,
+        batch_id: int,
+        merchant_dim_df: Optional[DataFrame] = None,
+    ) -> None:
+        """Micro-batch upsert handler using Delta MERGE.
+
+        Ensures deterministic latest-record retention and idempotent exactly-once
+        semantics when streaming from Bronze to Silver.
+        """
+        if batch_df.isEmpty():
+            return
+
+        silver_path = self.config.paths.get_table_path("silver", "orders")
+        cleaned_batch = self._clean_orders(batch_df)
+
+        if merchant_dim_df is not None:
+            cleaned_batch = self.enrich_with_merchant_data(cleaned_batch, merchant_dim_df)
+
+        try:
+            from delta.tables import DeltaTable
+            if DeltaTable.isDeltaTable(self.spark, silver_path):
+                target_table = DeltaTable.forPath(self.spark, silver_path)
+                match_cond = "target.order_id = source.order_id"
+                update_cond = "source.event_timestamp >= target.event_timestamp" if "event_timestamp" in cleaned_batch.columns else None
+
+                builder = target_table.alias("target").merge(
+                    cleaned_batch.alias("source"), match_cond
+                )
+                if update_cond:
+                    builder = builder.whenMatchedUpdate(condition=update_cond, set={c: f"source.{c}" for c in cleaned_batch.columns})
+                else:
+                    builder = builder.whenMatchedUpdateAll()
+
+                builder.whenNotMatchedInsertAll().execute()
+            else:
+                (
+                    cleaned_batch.write
+                    .format("delta")
+                    .mode("append")
+                    .partitionBy("event_date")
+                    .save(silver_path)
+                )
+        except Exception as e:
+            self.logger.warning(f"Delta merge fallback to append write: {e}")
+            cleaned_batch.write.format("delta").mode("append").partitionBy("event_date").save(silver_path)
+
+    def process_streaming(
+        self,
+        event_type: str = "orders",
+        merchant_dim_df: Optional[DataFrame] = None,
+        trigger_interval: Optional[str] = None,
+    ) -> StreamingQuery:
+        """Start continuous Structured Streaming pipeline from Bronze to Silver."""
+        bronze_path = self.config.paths.get_table_path("bronze", event_type)
+        checkpoint_path = self.config.paths.get_checkpoint_path(f"silver_{event_type}")
+        trigger = trigger_interval or self.config.streaming.trigger_interval
+
+        self.logger.info(f"Starting Silver streaming enrichment for '{event_type}'")
+
+        bronze_stream = (
+            self.spark.readStream
+            .format("delta")
+            .load(bronze_path)
+        )
+
+        def batch_handler(df: DataFrame, b_id: int):
+            if event_type == "orders":
+                self.upsert_orders_batch(df, b_id, merchant_dim_df)
+            else:
+                silver_path = self.config.paths.get_table_path("silver", event_type)
+                cleaned = self._clean_clickstream(df)
+                if merchant_dim_df is not None:
+                    cleaned = self.enrich_with_merchant_data(cleaned, merchant_dim_df)
+                cleaned.write.format("delta").mode("append").partitionBy("event_date").save(silver_path)
+
+        query = (
+            bronze_stream.writeStream
+            .format("delta")
+            .foreachBatch(batch_handler)
+            .option("checkpointLocation", checkpoint_path)
+            .trigger(processingTime=trigger)
+            .start()
+        )
+        return query

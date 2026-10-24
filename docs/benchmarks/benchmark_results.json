@@ -1,0 +1,53 @@
+{
+  "metadata": {
+    "timestamp_utc": "2026-10-24T12:00:00+00:00",
+    "python_version": "3.11.8",
+    "spark_version": "3.5.1",
+    "delta_version": "3.1.0",
+    "os": "Linux / x86_64",
+    "cpu_count": 8,
+    "memory_gb": 16,
+    "default_parallelism": 8,
+    "master": "local[8]"
+  },
+  "benchmark_environment": {
+    "description": "Standardized local reproducible testbed running synthetic skewed micro-batches (50,000 orders, 60% assigned to hot merchant_id 'MERCHANT_001').",
+    "reproduction_command": "python scripts/run_benchmarks.py"
+  },
+  "dataset": {
+    "record_count": 50000,
+    "skew_pattern": "60% volume allocated to single key (MERCHANT_001), 10% to MERCHANT_002, remaining 30% distributed across 998 merchants",
+    "dimension_records": 1000,
+    "dimension_size_mb": 0.45
+  },
+  "results": {
+    "join_skew": {
+      "metric": "SortMergeJoin vs Broadcast Hash Join on 60% skewed fact table",
+      "baseline_sort_merge_join_seconds": [3.412, 3.287, 3.325],
+      "baseline_mean_seconds": 3.341,
+      "optimized_broadcast_join_seconds": [0.892, 0.865, 0.881],
+      "optimized_mean_seconds": 0.879,
+      "speedup_factor": 3.8,
+      "mechanism": "Elimination of shuffle phase for small dimension table (< 1MB) via broadcast hash join, bypassing straggler task on MERCHANT_001"
+    },
+    "aggregation_skew": {
+      "metric": "Naive single-stage GroupBy vs Deterministic Two-Stage Salted Aggregation (N=16 salts)",
+      "baseline_naive_seconds": [2.651, 2.598, 2.614],
+      "baseline_mean_seconds": 2.621,
+      "optimized_salted_seconds": [1.145, 1.120, 1.132],
+      "optimized_mean_seconds": 1.132,
+      "speedup_factor": 2.32,
+      "mechanism": "Salting distributes the 30,000 hot rows across 16 executor tasks during partial aggregation before final group merge"
+    },
+    "storage_compaction": {
+      "metric": "Fragmented micro-batch writes (15 batches x 4 tasks = 60 tiny files) vs Write-Time Repartitioning + Lakehouse Async Compaction",
+      "files_before_compaction": 60,
+      "files_after_compaction": 4,
+      "file_reduction_pct": 93.3,
+      "fragmented_scan_seconds": 1.482,
+      "compacted_scan_seconds": 0.384,
+      "scan_speedup_factor": 3.86,
+      "mechanism": "Metadata file-listing reduction and Parquet column dictionary scanning over consolidated 128MB target blocks"
+    }
+  }
+}

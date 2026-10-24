@@ -20,9 +20,13 @@ spark = SparkConfig(app_name="small-files-notebook", mode="local").create_sessio
 engine = CompactionEngine(spark)
 
 # %% [markdown]
-# ## 1. Write-Time Fix: Intelligent Repartitioning
+# ## 1. Write-Time Fix: Volume-Based Repartitioning with Intra-Partition Distribution
 # Calculate optimal file partition count dynamically based on payload volume:
 # `num_partitions = max(1, total_size_mb // target_file_size_mb)`
+#
+# Note: Repartitioning solely on a low-cardinality column like `event_date` causes all records
+# for that day to land in a single writer partition. The engine combines `event_date` with an
+# intra-date hash bucket (`pmod(xxhash64(order_id), num_partitions)`) to ensure even file distribution.
 
 # %%
 events = list(generate_events_batch("orders", count=50000))

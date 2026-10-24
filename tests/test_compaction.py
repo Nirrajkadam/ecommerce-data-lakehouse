@@ -24,6 +24,30 @@ class TestWriteOptimization:
 
         assert result.count() == skewed_df.count()
 
+    def test_optimize_write_distributes_single_date_batch_across_multiple_partitions(
+        self, spark, skewed_df
+    ):
+        """Verify that a single-day batch with optimal_partitions > 1 occupies multiple partitions.
+
+        Regression check: previously, hashing strictly on 'event_date' routed all records to a
+        single partition (e.g. partition #1 of 4), leaving the remaining 3 partitions completely empty.
+        Intra-date bucketing ensures records are distributed across partitions.
+        """
+        engine = CompactionEngine(spark)
+        # 1000 rows, estimated 1MB per row to force optimal_partitions = 4 with target 256MB
+        df = skewed_df.withColumn("event_date", F.lit("2024-01-15"))
+        result = engine.optimize_write_partitioning(
+            df,
+            partition_col="event_date",
+            target_file_size_mb=1,
+            estimated_row_size_bytes=4000,
+        )
+
+        # Count records per partition to verify distribution
+        part_counts = result.rdd.glom().map(len).collect()
+        occupied_partitions = sum(1 for c in part_counts if c > 0)
+        assert occupied_partitions > 1
+
     def test_coalesce_reduces_partitions(self, spark, skewed_df):
         """Verify coalesce produces fewer partitions."""
         engine = CompactionEngine(spark)

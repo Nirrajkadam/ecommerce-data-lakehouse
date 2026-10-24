@@ -56,8 +56,16 @@ class WriteOptimizer:
             target_file_size_mb=self.target_file_size_mb,
         )
 
-        if partition_col:
-            return df.repartition(num_partitions, partition_col)
+        if partition_col and partition_col in df.columns and num_partitions > 1:
+            bucket_candidates = ["order_id", "event_id", "session_id", "inventory_id", "id", "customer_id", "user_id"]
+            hash_col = next((c for c in bucket_candidates if c in df.columns), None)
+            if hash_col:
+                bucket_expr = F.pmod(F.xxhash64(F.col(hash_col)), F.lit(num_partitions))
+            else:
+                bucket_expr = F.pmod(F.xxhash64(F.monotonically_increasing_id()), F.lit(num_partitions))
+            return df.repartition(num_partitions, F.col(partition_col), bucket_expr)
+        elif partition_col and partition_col in df.columns:
+            return df.repartition(num_partitions, F.col(partition_col))
         else:
             return df.repartition(num_partitions)
 

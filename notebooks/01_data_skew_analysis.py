@@ -75,7 +75,9 @@ broadcast_joined.explain(mode="simple")
 
 # %% [markdown]
 # ### Step 3: Adaptive Query Execution (AQE) Skew Join
-# Even if the dimension table is large and requires a SortMergeJoin, Spark 3+ AQE splits skewed partitions dynamically.
+# In batch execution and micro-batch foreachBatch stages, Spark 3+ AQE splits skewed partitions dynamically.
+# Note: Spark's streaming engine disables AQE for continuous streaming writes (see ResolveWriteToStream),
+# which is why streaming pipelines rely on broadcast joins, deterministic salting, and write-time partitioning.
 
 # %%
 handler.configure_aqe_skew(skew_factor=5)
@@ -83,14 +85,17 @@ print("AQE Skew Join Enabled:", spark.conf.get("spark.sql.adaptive.skewJoin.enab
 
 # %% [markdown]
 # ### Step 4: Deterministic Key Salting
-# When performing high-volume aggregations on skewed keys, salting spreads the key across N buckets.
+# When performing high-volume aggregations on skewed keys, deterministic salting
+# (using `pmod(xxhash64(order_id), N)`) spreads the dominant key across N buckets safely
+# without non-deterministic `rand()` hazards across task retries.
 
 # %%
 salted_agg = handler.salted_aggregation(
     orders_df,
-    key_col="merchant_id",
+    group_cols=["merchant_id", "event_date"],
     agg_exprs={"total_amount": "sum", "order_id": "count"},
-    num_salts=10
+    num_salts=10,
+    id_col="order_id",
 )
 salted_agg.show(10)
 

@@ -19,6 +19,7 @@ from typing import Optional
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
+from pyspark.sql.streaming import StreamingQuery
 
 from src.config.pipeline_config import PipelineConfig
 from src.optimizations.skew_handler import SkewHandler
@@ -61,39 +62,23 @@ class GoldLayer:
 
         orders = self.spark.read.format("delta").load(silver_path)
 
-        # ── SALTED AGGREGATION for skewed merchant_id ──
-        # Instead of a direct groupBy("merchant_id", "event_date"),
-        # which sends 60% of records to one reducer, we use two-stage
-        # salted aggregation to spread the work across 10 buckets.
-
-        # First, add the date grouping key as a combined key
-        orders_with_key = orders.withColumn(
-            "_agg_key",
-            F.concat(F.col("merchant_id"), F.lit("||"), F.col("event_date")),
-        )
-
-        # Stage 1: Partial aggregation with salted keys
+        # ── DETERMINISTIC SALTED AGGREGATION on native columns ──
+        # Instead of a fragile string concatenation of merchant_id and event_date
+        # (which corrupts null merchants and drops the date), we group natively by
+        # both columns, salting on a stable identifier (order_id) to balance the partitions.
         summary = self.skew_handler.salted_aggregation(
-            df=orders_with_key,
-            key_col="_agg_key",
+            df=orders,
+            group_cols=["merchant_id", "event_date"],
             agg_exprs={
                 "total_amount": "sum",
                 "order_id": "count",
             },
             num_salts=10,
+            id_col="order_id",
         )
 
-        # Extract merchant_id and event_date from the combined key
         summary = (
             summary
-            .withColumn(
-                "merchant_id",
-                F.split(F.col("_agg_key"), "\\|\\|").getItem(0),
-            )
-            .withColumn(
-                "event_date",
-                F.split(F.col("_agg_key"), "\\|\\|").getItem(1),
-            )
             .withColumn(
                 "avg_order_value",
                 F.col("total_amount") / F.col("order_id"),
@@ -284,3 +269,73 @@ class GoldLayer:
             self.build_product_performance()
 
         self.logger.info("All Gold tables built successfully")
+
+    def process_streaming(
+        self,
+        trigger_interval: Optional[str] = None,
+    ) -> StreamingQuery:
+        """Start continuous aggregation streaming from Silver orders to Gold summary.
+
+        Uses Delta streaming with foreachBatch and Delta MERGE with null-safe comparison
+        (<=>) to continuously update daily merchant aggregations as orders arrive.
+        """
+        silver_orders_path = self.config.paths.get_table_path("silver", "orders")
+        gold_path = self.config.paths.get_table_path("gold", "merchant_daily_summary")
+        checkpoint_path = self.config.paths.get_checkpoint_path("gold_merchant_daily_summary")
+        trigger = trigger_interval or self.config.streaming.trigger_interval
+
+        self.logger.info("Starting Gold streaming aggregations")
+
+        silver_stream = (
+            self.spark.readStream
+            .format("delta")
+            .load(silver_orders_path)
+        )
+
+        def merge_gold_batch(batch_df: DataFrame, batch_id: int):
+            if batch_df.isEmpty():
+                return
+            summary = self.skew_handler.salted_aggregation(
+                df=batch_df,
+                group_cols=["merchant_id", "event_date"],
+                agg_exprs={"total_amount": "sum", "order_id": "count"},
+                num_salts=10,
+                id_col="order_id",
+            ).withColumn("avg_order_value", F.col("total_amount") / F.col("order_id")) \
+             .select(
+                 "merchant_id",
+                 "event_date",
+                 F.col("total_amount").alias("total_revenue"),
+                 F.col("order_id").alias("total_orders"),
+                 "avg_order_value",
+             )
+
+            try:
+                from delta.tables import DeltaTable
+                if DeltaTable.isDeltaTable(self.spark, gold_path):
+                    target = DeltaTable.forPath(self.spark, gold_path)
+                    match_cond = "target.merchant_id <=> source.merchant_id AND target.event_date = source.event_date"
+                    target.alias("target").merge(
+                        summary.alias("source"), match_cond
+                    ).whenMatchedUpdate(
+                        set={
+                            "total_revenue": "target.total_revenue + source.total_revenue",
+                            "total_orders": "target.total_orders + source.total_orders",
+                            "avg_order_value": "(target.total_revenue + source.total_revenue) / (target.total_orders + source.total_orders)",
+                        }
+                    ).whenNotMatchedInsertAll().execute()
+                else:
+                    summary.write.format("delta").mode("append").partitionBy("event_date").save(gold_path)
+            except Exception as e:
+                self.logger.warning(f"Delta Gold merge fallback to append write: {e}")
+                summary.write.format("delta").mode("append").partitionBy("event_date").save(gold_path)
+
+        query = (
+            silver_stream.writeStream
+            .format("delta")
+            .foreachBatch(merge_gold_batch)
+            .option("checkpointLocation", checkpoint_path)
+            .trigger(processingTime=trigger)
+            .start()
+        )
+        return query

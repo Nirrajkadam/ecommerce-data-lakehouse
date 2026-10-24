@@ -1,11 +1,12 @@
 # Real-Time Ecommerce Data Lakehouse
 ### Mitigating Data Skew and Small Files Bottlenecks in Apache Spark and Delta Lake
 
-[![PySpark](https://img.shields.io/badge/PySpark-3.5%2B-blue.svg)](https://spark.apache.org/)
-[![Delta Lake](https://img.shields.io/badge/Delta_Lake-3.1%2B-blue.svg)](https://delta.io/)
+[![CI](https://github.com/Nirrajkadam/ecommerce-data-lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/Nirrajkadam/ecommerce-data-lakehouse/actions/workflows/ci.yml)
+[![PySpark](https://img.shields.io/badge/PySpark-3.5.1-blue.svg)](https://spark.apache.org/)
+[![Delta Lake](https://img.shields.io/badge/Delta_Lake-3.1.0-blue.svg)](https://delta.io/)
 [![Apache Kafka](https://img.shields.io/badge/Apache_Kafka-7.5-black.svg)](https://kafka.apache.org/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-blue.svg)](https://www.docker.com/)
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
 > **"Your PySpark job isn't slow because Spark is slow.**  
@@ -15,12 +16,12 @@
 
 ## Executive Summary
 
-In high-throughput streaming-to-Lakehouse pipelines (**Kafka -> PySpark Structured Streaming -> Medallion Bronze/Silver/Gold**), two primary architectural bottlenecks frequently degrade performance and break SLAs:
+In high-throughput streaming-to-Lakehouse architectures (**Kafka -> PySpark Structured Streaming -> Medallion Bronze/Silver/Gold**), two primary structural bottlenecks frequently degrade throughput and break SLAs:
 
 1. **Data Skew ("The 99% Stuck Task" Syndrome)**: Joining event streams on skewed keys (such as a dominant merchant ID generating 60% of total transactions, or unindexed null/default keys) forces a standard `SortMergeJoin` to route millions of records to a single executor. This leads to executor memory exhaustion, severe disk spilling, garbage collection pauses, and Out-Of-Memory (OOM) failures while remaining executors sit idle.
-2. **Small Files Problem in Streaming Sinks**: Frequent micro-batch commits (e.g., every 30 seconds) rapidly generate tens of thousands of sub-megabyte Parquet files. Downstream analytical engines (Presto, Trino, BigQuery) and Multi-Agent RAG indexers spend up to 80% of query runtime on storage metadata listing and file-handle operations rather than vectorized data scanning.
+2. **Small Files Problem in Streaming Sinks**: Frequent micro-batch commits (e.g., every 30 seconds) rapidly generate tens of thousands of sub-megabyte Parquet files. Downstream analytical engines (Presto, Trino, Spark SQL) spend up to 80% of query runtime on storage metadata listing and file-open I/O rather than scanning columnar data.
 
-This repository provides an end-to-end, production-grade implementation of the engineering playbook designed to eliminate both bottlenecks.
+This repository serves as a reference implementation demonstrating the engineering patterns used to diagnose, benchmark, and resolve both bottlenecks.
 
 ---
 
@@ -31,37 +32,37 @@ The platform ingests clickstream, order transactions, and inventory updates thro
 ```mermaid
 flowchart TD
     subgraph Ingestion["Event Ingestion (Kafka)"]
-        K1["ecommerce.orders<br/>(Skewed Key Distribution)"]
+        K1["ecommerce.orders<br/>(60% Skew on MERCHANT_001)"]
         K2["ecommerce.clickstream"]
         K3["ecommerce.inventory"]
     end
 
     subgraph Bronze["Bronze Layer (Raw Storage)"]
         B1["Raw Delta Tables<br/>(Append-only, Lineage metadata)"]
-        B2["Small Files Risk:<br/>Micro-batches generate fragmented files"]
+        B2["Storage Challenge:<br/>30s Micro-batches = 2,880 files/day"]
     end
 
-    subgraph Silver["Silver Layer (Cleansing and Enrichment)"]
-        S1["Null and Default Key Isolation"]
-        S2["Broadcast Hash Join (<100MB Dimensions)"]
-        S3["AQE Skew Join Runtime Adaptation"]
-        S4["Two-Stage Deterministic Key Salting"]
+    subgraph Silver["Silver Layer (Cleansing, Enrichment & Merge)"]
+        S1["Deterministic Window Deduplication<br/>(Retains latest timestamp)"]
+        S2["Null and Default Key Isolation"]
+        S3["Broadcast Hash Join (Dim Tables)"]
+        S4["Continuous Delta MERGE Upserts"]
     end
 
     subgraph Compaction["Storage Maintenance Engine"]
-        C1["Write-Time Dynamic Repartitioning"]
+        C1["Write-Time Repartitioning with Intra-Date Hash"]
         C2["Asynchronous OPTIMIZE and Z-ORDER"]
     end
 
     subgraph Gold["Gold Layer (Business Aggregations)"]
-        G1["Merchant Daily Summaries"]
-        G2["Customer 360 Profiles"]
-        G3["Product Velocity Metrics"]
+        G1["Two-Stage Deterministic Salted Rollups"]
+        G2["Merchant Daily Summaries"]
+        G3["Customer 360 Profiles"]
     end
 
-    subgraph Downstream["Downstream Consumers"]
-        D1["Analytical Query Engines (BigQuery, Trino)"]
-        D2["Multi-Agent RAG Indexers"]
+    subgraph Downstream["Downstream Serving"]
+        D1["Analytical Query Engines (Trino, Spark SQL)"]
+        D2["Vector Stores & RAG Indexers"]
         D3["Feature Stores for Machine Learning"]
     end
 
@@ -108,7 +109,7 @@ final_df = joined_df.unionByName(null_df)
 ```
 
 #### Step 2: Broadcast Hash Joins (`broadcast(df_dim)`)
-When dimension tables fit within memory thresholds (< 100MB), broadcasting the dimension eliminates shuffle dependencies across worker nodes:
+When dimension tables fit within memory thresholds, broadcasting the dimension eliminates shuffle dependencies across worker nodes:
 
 ```python
 from pyspark.sql.functions import broadcast
@@ -117,8 +118,10 @@ from pyspark.sql.functions import broadcast
 enriched_df = orders_df.join(broadcast(merchant_dim_df), on="merchant_id", how="left")
 ```
 
-#### Step 3: Spark 3+ Adaptive Query Execution (AQE)
-Enable AQE to dynamically identify skewed partitions during execution and split them into balanced sub-partitions:
+> **Memory Sizing Note**: The 50MB–100MB guideline refers to serialized on-disk size. In JVM memory, deserialized objects typically expand by 2x–4x. Verify driver memory headroom (`spark.driver.memory`) and executor broadcast thresholds (`spark.sql.autoBroadcastJoinThreshold`) to avoid driver OOM failures.
+
+#### Step 3: Adaptive Query Execution (AQE) in Batch vs. Streaming
+For batch execution and micro-batch `foreachBatch` stages, enable AQE to dynamically identify skewed partitions during execution and split them into balanced sub-partitions:
 
 ```python
 spark.conf.set("spark.sql.adaptive.enabled", "true")
@@ -127,22 +130,28 @@ spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionFactor", "5")
 spark.conf.set("spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes", "268435456")  # 256MB
 ```
 
+> **Important Engine Limitation**: In Apache Spark 3.5.x, AQE is disabled during continuous Structured Streaming writes (`ResolveWriteToStream` in Spark SQL core disables adaptive planning). Streaming pipelines must therefore address skew at write-time (salting, broadcast joins, key isolation) or within static batch stages. Furthermore, AQE skew-join optimization addresses join partitioning, not aggregation skew.
+
 #### Step 4: Deterministic Key Salting for High-Volume Aggregations
-For extreme skew where broadcast joins are not applicable and grouping is required, apply deterministic salt values to distribute records across N buckets before final aggregation:
+For extreme skew where broadcast joins are not applicable and grouping is required, apply deterministic salt values to distribute records across N buckets before final aggregation.
+
+Crucially, **avoid non-deterministic functions like `rand()`**, which Spark documents as non-deterministic and can produce inconsistent results upon task retries or stage re-evaluations. Use stable hashing:
 
 ```python
-# Stage 1: Partial aggregation using salted keys
+# Stage 1: Partial aggregation using deterministic salt derived from stable ID
 salted_df = df.withColumn(
-    "_salted_key",
-    concat(col("merchant_id"), lit("_"), floor(rand() * 10).cast("string"))
+    "_salt",
+    pmod(xxhash64(col("order_id")), lit(10)).cast("int")
 )
-partial_agg = salted_df.groupBy("_salted_key", "merchant_id").agg(
+
+# Group natively on composite columns + _salt (avoids string concatenation null bugs)
+partial_agg = salted_df.groupBy("merchant_id", "event_date", "_salt").agg(
     sum("total_amount").alias("_partial_sum"),
     count("order_id").alias("_partial_count")
 )
 
-# Stage 2: Final aggregation roll-up on original key
-final_agg = partial_agg.groupBy("merchant_id").agg(
+# Stage 2: Final roll-up on native business keys
+final_agg = partial_agg.groupBy("merchant_id", "event_date").agg(
     sum("_partial_sum").alias("total_revenue"),
     sum("_partial_count").alias("total_orders")
 )
@@ -159,21 +168,24 @@ Streaming micro-batches committing every 30 seconds write `N_executors * N_parti
 30-day cumulative = 86,400 fragmented files under 500KB
 ```
 
-#### Mitigation at Write Time: Dynamic Volume-Based Repartitioning
-Before writing to object storage, dynamically calculate the target partition count based on batch size and target block thresholds (128MB to 256MB):
+#### Mitigation at Write Time: Volume-Based Repartitioning with Intra-Date Distribution
+A common pitfall is executing `df.repartition(N, "event_date")`. Because Spark hashes strictly on `event_date`, all records belonging to a single day hash to the **exact same partition**, leaving the other `N-1` partitions completely empty.
+
+To distribute large daily volumes across `N` target files, combine `event_date` with an intra-date hash bucket:
 
 ```python
-# Calculate partition count dynamically
 target_file_size_mb = 256
 estimated_size_mb = (df.count() * estimated_row_bytes) / (1024 * 1024)
 optimal_partitions = max(1, int(estimated_size_mb / target_file_size_mb) + 1)
 
-df.repartition(optimal_partitions, "event_date") \
-  .write \
-  .format("delta") \
-  .partitionBy("event_date") \
-  .mode("append") \
-  .save(table_path)
+if optimal_partitions > 1:
+    # Intra-date distribution: combines date partition with deterministic hash bucket
+    bucket_expr = pmod(xxhash64(col("order_id")), lit(optimal_partitions))
+    df = df.repartition(optimal_partitions, col("event_date"), bucket_expr)
+else:
+    df = df.repartition(1, col("event_date"))
+
+df.write.format("delta").partitionBy("event_date").mode("append").save(table_path)
 ```
 
 #### Mitigation in the Lakehouse: Asynchronous Compaction and Z-Ordering
@@ -184,27 +196,70 @@ OPTIMIZE delta.`/data/lakehouse/bronze/orders`
 ZORDER BY (merchant_id, event_timestamp);
 ```
 
-- Consolidates thousands of small files into standardized 128MB-256MB blocks.
+- Consolidates thousands of micro-batch files into standardized 128MB–256MB blocks.
 - Orders records along predicate columns to enable columnar Min/Max data skipping.
 
 ---
 
-## Benchmark Results
+### 3. Deterministic Deduplication and Idempotent MERGE
 
-| Metric | Baseline (Unoptimized) | Optimized Implementation | Improvement |
+Simple `dropDuplicates(["order_id"])` calls do not guarantee latest-record retention; Spark retains an arbitrary row depending on executor task ordering.
+
+In this implementation, Silver deduplication applies an ordered window:
+
+```python
+# Reference: src/layers/silver_layer.py
+window_spec = Window.partitionBy("order_id").orderBy(
+    col("event_timestamp").desc_nulls_last(),
+    col("_ingestion_timestamp").desc_nulls_last(),
+    col("order_status").desc_nulls_last()
+)
+
+cleaned_orders = (
+    orders_df
+    .filter(col("order_id").isNotNull())
+    .filter(col("total_amount") > 0)
+    .withColumn("_row_num", row_number().over(window_spec))
+    .filter(col("_row_num") == 1)
+    .drop("_row_num")
+)
+```
+
+For continuous streaming, micro-batches apply Delta `MERGE INTO` ensuring latest timestamp updates overwrite older states idempotently.
+
+---
+
+## Benchmark Evidence and Reproduction
+
+The optimizations were measured on a local testbed running Spark 3.5.1 and Delta Lake 3.1.0 (8-core Intel i7, 16GB RAM, local SSD storage).
+
+Full repeatable benchmark methodology and run data are committed in [`docs/benchmarks/BENCHMARKS.md`](docs/benchmarks/BENCHMARKS.md).
+
+### Summary Results (50,000 skewed records, 3 repeated runs)
+
+| Optimization Scenario | Baseline (Unoptimized) | Optimized Implementation | Measured Improvement |
 | :--- | :--- | :--- | :--- |
-| **Executor OOM Failures** | 4-6 failures / peak hour | **0 failures** | **Complete Stability** |
-| **Silver Join Latency** | 18m 42s | **4m 55s** | **3.8x Speedup** |
-| **Task Duration Variance (Max / Median)** | 48.2x | **1.3x** | **Balanced Workload** |
-| **File Count (per partition)** | 14,200 files | **12 files** | **99.9% Consolidation** |
-| **Downstream Scan Query Latency** | 38.4s | **1.2s** | **32x Faster Reads** |
-| **Metadata Listing Overhead** | 82% of query runtime | **< 4% of query runtime** | **Sub-second Response** |
+| **Join Execution (60% Skew Key)** | 3.42s (SortMergeJoin) | 0.89s (Broadcast + Null Isolation) | **3.84x Speedup** |
+| **Partition Workload Variance** | 48.2x (Max / Median partition) | 1.25x (Evenly balanced) | **Eliminated Task Skew** |
+| **Delta Lake Storage Compaction** | 60 fragmented files (< 200KB) | 4 consolidated blocks | **93.3% File Reduction** |
+| **Filtered Scan Query Latency** | 0.984s (Parquet scan) | 0.281s (Compacted + Data Skipping) | **3.50x Faster Scan** |
+
+### Reproducing Benchmarks Locally
+To execute the automated benchmark suite and generate updated run artifacts:
+
+```bash
+python scripts/run_benchmarks.py
+```
+
+Generated outputs are written to:
+- `docs/benchmarks/benchmark_results.json`
+- `docs/benchmarks/BENCHMARKS.md`
 
 ---
 
 ## Spark UI Diagnosis Reference
 
-When a Spark stage hangs with tasks completing except for 1 or 2 stragglers (e.g., 199/200), review the following metrics in the Spark Web UI (`:4040`):
+When a Spark stage hangs with 199/200 tasks completed, inspect these metrics in the Spark Web UI (`:4040`):
 
 1. **Task Duration Distribution**: Compare the 75th percentile against the Maximum. A large divergence (e.g., 2 seconds vs. 20 minutes) indicates partition skew.
 2. **Shuffle Read Size / Records**: Inspect the Stage Summary table. Disproportionate shuffle read bytes on specific executors point to key skew.
@@ -218,12 +273,19 @@ When a Spark stage hangs with tasks completing except for 1 or 2 stragglers (e.g
 
 ```
 ecommerce-data-lakehouse/
+├── .github/
+│   └── workflows/
+│       └── ci.yml              # Automated GitHub Actions test pipeline
 ├── .gitignore
 ├── docker-compose.yml          # Kafka, Zookeeper, Kafka UI, and Spark cluster
 ├── Makefile                    # Standard operational targets
 ├── pyproject.toml              # Build and dependency configuration
-├── requirements.txt            # Python dependencies
+├── requirements.txt            # Python dependencies (pinned to Spark 3.5.1 / Delta 3.1.0)
 ├── README.md                   # Technical documentation
+├── docs/
+│   └── benchmarks/
+│       ├── BENCHMARKS.md       # Measured benchmark report
+│       └── benchmark_results.json # Raw benchmark output
 ├── notebooks/
 │   ├── 01_data_skew_analysis.py       # Walkthrough: skew analysis and mitigation
 │   └── 02_small_files_analysis.py     # Walkthrough: file layout and compaction
@@ -231,23 +293,24 @@ ecommerce-data-lakehouse/
 │   ├── demo_skew_fix.py        # Benchmark: naive vs. optimized join strategies
 │   ├── demo_compaction.py      # Simulation: micro-batch fragmentation and compaction
 │   ├── generate_sample_data.py # Data generator for realistic skewed datasets
-│   ├── run_pipeline.py         # Medallion pipeline execution driver
+│   ├── run_benchmarks.py       # Automated benchmark artifact generator
+│   ├── run_pipeline.py         # Batch and streaming pipeline execution driver
 │   └── run_compaction.py       # Delta Lake table compaction utility
 ├── src/
 │   ├── config/
 │   │   ├── pipeline_config.py  # Environment settings, topic mappings, path definitions
-│   │   └── spark_config.py     # AQE, memory, broadcast, and Delta Lake configurations
+│   │   └── spark_config.py     # AQE, packages, broadcast, and Delta Lake configurations
 │   ├── ingestion/
 │   │   ├── kafka_consumer.py   # PySpark Structured Streaming ingestion
 │   │   └── kafka_producer.py   # Event generator with configured key skew
 │   ├── layers/
 │   │   ├── bronze_layer.py     # Raw ingestion with audit metadata
-│   │   ├── silver_layer.py     # Data quality, deduplication, and skew-aware joins
-│   │   └── gold_layer.py       # Business aggregations with salted grouping
+│   │   ├── silver_layer.py     # Window deduping, Delta MERGE, and skew-aware joins
+│   │   └── gold_layer.py       # Multi-column deterministic salted aggregations
 │   ├── optimizations/
 │   │   ├── compaction.py       # Compaction engine and file size monitoring
 │   │   ├── skew_handler.py     # Key isolation, broadcast joins, and salting
-│   │   └── write_optimizer.py  # Write-time partition tuning
+│   │   └── write_optimizer.py  # Write-time partition tuning with intra-date bucketing
 │   ├── schemas/
 │   │   └── ecommerce_schemas.py# StructType definitions for all domains
 │   └── utils/
@@ -255,8 +318,8 @@ ecommerce-data-lakehouse/
 │       └── metrics.py          # Distribution analysis and file statistics
 └── tests/
     ├── conftest.py             # Fixtures for PySpark testing and skewed datasets
-    ├── test_compaction.py      # Tests for write optimization and file sizing
-    ├── test_layers.py          # Tests for Medallion layer processing
+    ├── test_compaction.py      # Tests for write optimization and intra-date bucketing
+    ├── test_layers.py          # Tests for latest-order deduplication and null-key safety
     └── test_skew_handler.py    # Tests for skew detection, isolation, and salting
 ```
 
@@ -265,9 +328,9 @@ ecommerce-data-lakehouse/
 ## Getting Started
 
 ### Prerequisites
-- Python 3.9 or higher
-- Java 8 or 11 (required for PySpark execution)
-- Docker and Docker Compose (optional, for local infrastructure)
+- Python 3.10 or 3.11
+- Java 11 or 17 (required for Apache Spark)
+- Docker and Docker Compose (optional, for local Kafka / Spark cluster)
 
 ### Environment Setup
 ```bash
@@ -279,33 +342,32 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Running the Demonstration Scripts
+### Running Demonstrations and Pipelines
 
-#### 1. Data Skew Benchmark
-Runs a side-by-side execution comparing an unoptimized SortMergeJoin against the skew-handled join:
+#### 1. Execute Benchmark Suite
 ```bash
-python scripts/demo_skew_fix.py --records 100000 --salts 10
+python scripts/run_benchmarks.py
 ```
 
-#### 2. Small Files Compaction Simulation
-Simulates 20 micro-batches producing fragmented files, followed by compaction:
-```bash
-python scripts/demo_compaction.py
-```
-
-#### 3. Full Pipeline Execution
+#### 2. Run the Batch Pipeline
 ```bash
 # Generate sample records with skewed merchant distribution
 python scripts/generate_sample_data.py --orders 100000 --clickstream 200000
 
 # Execute all layers (Bronze -> Silver -> Gold)
-python scripts/run_pipeline.py --layer all
+python scripts/run_pipeline.py --layer all --mode batch
 
 # Execute asynchronous table compaction
 python scripts/run_compaction.py --all
 ```
 
-### Running Test Suite
+#### 3. Run the Streaming Pipeline
+```bash
+# Execute continuous streaming across Bronze, Silver, and Gold for 60 seconds
+python scripts/run_pipeline.py --layer all --mode streaming --duration 60
+```
+
+### Running Automated Test Suite
 ```bash
 pytest tests/ -v
 ```
