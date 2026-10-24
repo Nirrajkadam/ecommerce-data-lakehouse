@@ -27,6 +27,8 @@ This repository serves as a reference implementation demonstrating the engineeri
 
 ## Architecture and Data Flow
 
+![PySpark Data Skew and Small Files Architecture](docs/images/pyspark_skew_and_small_files_architecture.jpg)
+
 The platform ingests clickstream, order transactions, and inventory updates through Kafka, processes them via PySpark Structured Streaming into Delta Lake, and applies targeted optimizations across the Medallion layers:
 
 ```mermaid
