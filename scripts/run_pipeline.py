@@ -97,7 +97,7 @@ def main():
         if args.layer in ("gold", "all"):
             run_gold(spark, config)
 
-        logger.info("Pipeline complete ✅")
+        logger.info("Pipeline execution completed successfully.")
     except Exception as e:
         logger.error(f"Pipeline failed: {e}")
         raise

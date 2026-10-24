@@ -36,7 +36,7 @@ def main():
                         help="Output directory")
     args = parser.parse_args()
 
-    print(f"\n📊 Generating sample ecommerce data...")
+    print(f"\nGenerating sample ecommerce data...")
     print(f"   Orders:      {args.orders:>10,}")
     print(f"   Clickstream: {args.clickstream:>10,}")
     print(f"   Inventory:   {args.inventory:>10,}")
@@ -49,10 +49,10 @@ def main():
         inventory_count=args.inventory,
     )
 
-    print(f"\n✅ Sample data generated:")
+    print(f"\nSample data generation complete:")
     for event_type, filepath in files.items():
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
-        print(f"   {event_type:<15} → {filepath} ({size_mb:.1f} MB)")
+        print(f"   {event_type:<15} -> {filepath} ({size_mb:.1f} MB)")
     print()
 
 

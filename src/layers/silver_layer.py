@@ -1,19 +1,16 @@
 """
-Silver Layer — Data Cleansing & Enrichment
+Silver Layer - Data Cleansing & Enrichment
 ==========================================
 Cleans, deduplicates, and enriches Bronze data into analytics-ready datasets.
 
-██████████████████████████████████████████████████████████████
-█  DEMONSTRATES: Data Skew Fixes During Joins              █
-██████████████████████████████████████████████████████████████
-
+Demonstrates Data Skew Fixes During Joins:
 When joining orders with merchant dimensions on merchant_id, a naive
-SortMergeJoin routes ALL records for MERCHANT_001 (60% of traffic)
-to a SINGLE executor. That executor:
+SortMergeJoin routes all records for MERCHANT_001 (60% of traffic)
+to a single executor. That executor:
   - Receives 600,000 out of 1,000,000 records
   - Spills to disk when memory fills up
   - Takes 10x longer than the other 199 tasks
-  - May OOM crash under peak load
+  - May trigger an Out-of-Memory failure under peak load
 
 This module applies the complete fix playbook:
   1. Null/Default key isolation
@@ -133,7 +130,7 @@ class SilverLayer:
 
         ──── BEFORE (Naive Join) ────────────────────────────────────
         >>> result = orders.join(merchants, "merchant_id")
-        # SortMergeJoin → 60% of data goes to 1 partition → OOM 💥
+        # SortMergeJoin -> 60% of data routed to 1 partition -> OOM / disk spill
 
         ──── AFTER (Optimized Join) ─────────────────────────────────
         The fix applies three techniques:

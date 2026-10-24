@@ -36,7 +36,7 @@ def run_demo():
     """Run the small files compaction demonstration."""
 
     print("\n" + "=" * 70)
-    print("  📁 SMALL FILES PROBLEM — INTERACTIVE DEMO")
+    print("  SMALL FILES COMPACTION BENCHMARK")
     print("=" * 70)
 
     config = SparkConfig(app_name="compaction-demo", mode="local")
@@ -85,8 +85,8 @@ def run_demo():
 
     # Show the problem
     problem_stats = engine.monitor_file_sizes(problem_path)
-    print(f"\n  ⚠️  THE PROBLEM:")
-    print(f"  ────────────────────────────────────────")
+    print(f"\n  [1] Storage Fragmentation Baseline:")
+    print(f"  ----------------------------------------")
     print(f"  Total Files:      {problem_stats['file_count']}")
     print(f"  Total Size:       {problem_stats['total_size_mb']:.2f} MB")
     print(f"  Avg File Size:    {problem_stats['avg_file_size_mb']:.4f} MB")
@@ -95,8 +95,8 @@ def run_demo():
         print(f"  Max File Size:    {problem_stats['max_file_size_mb']:.4f} MB")
     if 'small_file_count' in problem_stats:
         print(f"  Small Files:      {problem_stats['small_file_count']}")
-    print(f"\n  Each query must open {problem_stats['file_count']} files!")
-    print(f"  80% of query time is spent on file I/O, not data scanning.\n")
+    print(f"\n  Queries must enumerate {problem_stats['file_count']} individual files.")
+    print(f"  Metadata overhead dominates query execution.\n")
 
     # Benchmark query on fragmented data
     start = time.time()
@@ -106,15 +106,15 @@ def run_demo():
     # ════════════════════════════════════════════════════════
     # STEP 2: Apply the Fix (Compaction)
     # ════════════════════════════════════════════════════════
-    print("  Step 2: Compacting files (read → coalesce → write)...\n")
+    print("  Step 2: Consolidating files via write-time partitioning...\n")
 
     df = spark.read.parquet(problem_path)
     optimized_df = engine.optimize_write_partitioning(df, "event_date")
     optimized_df.write.mode("overwrite").parquet(fixed_path)
 
     fixed_stats = engine.monitor_file_sizes(fixed_path)
-    print(f"  ✅ THE FIX:")
-    print(f"  ────────────────────────────────────────")
+    print(f"  [2] Consolidated Layout:")
+    print(f"  ----------------------------------------")
     print(f"  Total Files:      {fixed_stats['file_count']}")
     print(f"  Total Size:       {fixed_stats['total_size_mb']:.2f} MB")
     print(f"  Avg File Size:    {fixed_stats['avg_file_size_mb']:.4f} MB")
@@ -134,10 +134,10 @@ def run_demo():
     speedup = fragmented_time / max(compacted_time, 0.001)
 
     print(f"\n  {'=' * 50}")
-    print(f"  📊 BEFORE vs AFTER COMPACTION")
+    print(f"  BEFORE VS. AFTER COMPACTION COMPARISON")
     print(f"  {'=' * 50}")
     print(f"  {'Metric':<25} {'Before':>12} {'After':>12}")
-    print(f"  {'─' * 25} {'─' * 12} {'─' * 12}")
+    print(f"  {'-' * 25} {'-' * 12} {'-' * 12}")
     print(f"  {'File Count':<25} {problem_stats['file_count']:>12} {fixed_stats['file_count']:>12}")
     print(f"  {'Avg File Size':<25} {problem_stats['avg_file_size_mb']:>11.4f}MB {fixed_stats['avg_file_size_mb']:>11.4f}MB")
     print(f"  {'Query Time':<25} {fragmented_time:>11.3f}s {compacted_time:>11.3f}s")
@@ -148,7 +148,7 @@ def run_demo():
 
     spark.stop()
     shutil.rmtree(base_path, ignore_errors=True)
-    print("\n  Demo complete! ✅\n")
+    print("\n  Compaction benchmark complete.\n")
 
 
 if __name__ == "__main__":

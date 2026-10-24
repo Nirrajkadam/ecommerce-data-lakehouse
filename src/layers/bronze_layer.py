@@ -83,9 +83,9 @@ class BronzeLayer:
         Reads from Kafka topic, adds metadata, and writes to Bronze
         Delta table with micro-batch processing.
 
-        ⚠️ WITHOUT write-time optimization, this creates the Small Files
-        Problem — each micro-batch (every 30s) creates new files:
-            30s × 2 files/batch = 2,880 files/day per partition!
+        Note: Without write-time optimization, this creates the Small Files
+        Problem - each micro-batch (every 30s) creates new files:
+            30s * 2 files/batch = 2,880 files/day per partition!
 
         Args:
             event_type: Type of event ("orders", "clickstream", "inventory").
